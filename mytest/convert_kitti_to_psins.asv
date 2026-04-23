@@ -1,0 +1,139 @@
+%% 转换KITTI oxts数据为PSINS IMU数据格式
+clear; clc; close all;
+
+% ==================== 用户设置 ====================
+kitti_root = 'C:\Users\12091\Desktop\neural_network\devkit_raw_data\2011_09_26_drive_0009_sync/'; % 修改为你的数据路径
+% =================================================
+
+oxts_dir = fullfile(kitti_root, 'oxts');
+data_dir = fullfile(oxts_dir, 'data');
+timestamps_file = fullfile(oxts_dir, 'timestamps.txt');
+
+%% 1. 读取时间戳
+fid = fopen(timestamps_file, 'r');
+timestamps_str = textscan(fid, '%s', 'Delimiter', '\n');
+fclose(fid);
+timestamps_str = timestamps_str{1};
+t_gps = datetime(timestamps_str, 'InputFormat', 'yyyy-MM-dd HH:mm:ss.SSSSSS');
+t_rel = seconds(t_gps - t_gps(1));  % 相对时间，第一帧为0
+N = length(t_rel);
+fprintf('共 %d 帧数据\n', N);
+
+%% 2. 转换IMU数据
+imu_data = zeros(N, 7);  % 列：t, wx, wy, wz, ax, ay, az
+for i = 1:N
+    fname = sprintf('%010d.txt', i-1);  % 文件名从0开始
+    filepath = fullfile(data_dir, fname);
+    
+    % 读取一行数据
+    fid = fopen(filepath, 'r');
+    data = textscan(fid, '%f', 30);
+    fclose(fid);
+    data = data{1}';
+    
+    % 提取原始IMU (KITTI: 前-左-上)
+    ax = data(13); ay = data(14); az = data(15);
+    wx = data(19); wy = data(20); wz = data(21);
+    
+    % 变换到前-右-下
+    ax_new = ax;
+    ay_new = -ay;
+    az_new = -az;
+    wx_new = wx;
+    wy_new = -wy;
+    wz_new = -wz;
+    
+    imu_data(i, :) = [t_rel(i), wx_new, wy_new, wz_new, ax_new, ay_new, az_new];
+end
+
+% 保存IMU数据
+imu_file = fullfile(kitti_root, 'imu_data.txt');
+save(imu_file, 'imu_data', '-ascii', '-double');
+fprintf('IMU数据已保存至：%s\n', imu_file);
+
+%% 3. 处理初始姿态和位置（使用第一个文件）
+fname = sprintf('%010d.txt', 0);
+filepath = fullfile(data_dir, fname);
+fid = fopen(filepath, 'r');
+data0 = textscan(fid, '%f', 30);
+fclose(fid);
+data0 = data0{1}';
+
+% 提取位置
+lat = data0(1);   % 纬度(°)
+lon = data0(2);   % 经度(°)
+alt = data0(3);   % 海拔(m)
+
+% 提取原始姿态 (KITTI)
+roll_k = data0(4);   % 左倾为正
+pitch_k = data0(5);  % 低头为正
+yaw_k = data0(6);    % 从东逆时针为正
+
+% 转换为右手定则标准角（绕轴正转）
+yaw_std = yaw_k;          % 绕z正转（逆时针）已经是正
+pitch_std = -pitch_k;     % 低头为正 => 绕y负转，取负
+roll_std = -roll_k;       % 左倾为正 => 绕x负转，取负
+
+% 计算旋转矩阵函数
+Rz = @(a) [cos(a), -sin(a), 0; sin(a), cos(a), 0; 0,0,1];
+Ry = @(a) [cos(a), 0, sin(a); 0,1,0; -sin(a),0,cos(a)];
+Rx = @(a) [1,0,0; 0,cos(a),-sin(a); 0,sin(a),cos(a)];
+
+% 1. 载体（前-左-上）到ENU的姿态矩阵
+Cb_enu = Rz(yaw_std) * Ry(pitch_std) * Rx(roll_std);
+
+% 2. 变换载体坐标系到前-右-下
+T = diag([1, -1, -1]);
+Cb1_enu = Cb_enu * T;   % 新载体到ENU
+
+% 3. ENU到NED变换矩阵
+C_enu_ned = [0, 1, 0; 
+             1, 0, 0; 
+             0, 0, -1];
+Cb1_ned = C_enu_ned * Cb1_enu;  % 新载体到NED
+
+% 4. 导航到载体的姿态矩阵
+C_ned_b1 = Cb1_ned';   % 即C_n^b
+
+% 5. 手动提取姿态角（ZYX顺序，航向从北顺时针）
+% 参考公式：T = C_n^b,  pitch = asin(-T(1,3)), roll = atan2(T(2,3), T(3,3)), yaw = atan2(T(1,2), T(1,1))
+pitch_psins = asin(-C_ned_b1(1,3));
+roll_psins = atan2(C_ned_b1(2,3), C_ned_b1(3,3));
+yaw_psins = atan2(C_ned_b1(1,2), C_ned_b1(1,1));
+att_psins = [pitch_psins; roll_psins; yaw_psins];  % 顺序：[pitch; roll; yaw]
+
+% 若已安装PSINS工具箱，可用m2att验证
+try
+    addpath('D:\zyyUse\导航\psins\psins251010');  % 如有需要，修改为实际路径
+    att_m2att = m2att(C_ned_b1);
+    disp('PSINS m2att 结果：');
+    disp(att_m2att);
+    disp('手动计算 结果：');
+    disp(att_psins);
+catch
+    disp('未找到PSINS工具箱，使用手动计算结果。');
+end
+
+% 保存初始参数（一行：lat, lon, alt, roll, pitch, yaw）
+init_data = [lat, lon, alt, att_psins(2), att_psins(1), att_psins(3)];  % 注意顺序：roll, pitch, yaw
+init_file = fullfile(kitti_root, 'init.txt');
+save(init_file, 'init_data', '-ascii', '-double');
+fprintf('初始参数已保存至：%s\n', init_file);
+
+% 显示结果
+fprintf('\n初始位置: lat=%.8f°, lon=%.8f°, alt=%.2f m\n', lat, lon, alt);
+fprintf('初始姿态 (PSINS): roll=%.6f rad, pitch=%.6f rad, yaw=%.6f rad\n', att_psins(2), att_psins(1), att_psins(3));
+fprintf('注意：roll右倾为正，pitch抬头为正，yaw从北顺时针为正。\n');
+
+%% 4. 可选：绘制IMU数据检查
+figure;
+subplot(2,1,1);
+plot(imu_data(:,1), imu_data(:,2:4));
+legend('wx','wy','wz');
+xlabel('时间 (s)'); ylabel('角速度 (rad/s)');
+title('陀螺仪数据');
+subplot(2,1,2);
+plot(imu_data(:,1), imu_data(:,5:7));
+legend('ax','ay','az');
+xlabel('时间 (s)'); ylabel('加速度 (m/s^2)');
+title('加速度计数据');
